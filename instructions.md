@@ -90,9 +90,9 @@ for rg_fragment in row_group_fragments:
 
 1. **Positional deletes**: When `positional_deletes` is not None, the filter is already disabled at the Scanner level (line 1653). Row-group pruning should also be skipped in this case since positional delete indices are file-global and depend on knowing the exact row offsets.
 
-2. **File-like object compatibility**: Verify that `split_by_row_group()` works when the fragment was created from a file-like object (`make_fragment(fin)`) rather than a file path. If it doesn't, an alternative is to read Parquet metadata via `pq.ParquetFile(fin).metadata`, manually check row-group column statistics, and pass the matching row-group indices to `fragment.subset(row_group_ids=[...])`.
+2. **File-like object compatibility**: Verified that `split_by_row_group()` works when the fragment is created from a file-like object (`make_fragment(fin)`). Tested with Azure ADLS (`AzureBlobFile`) — it is seekable, PyArrow reads the Parquet footer correctly, and `split_by_row_group(filter=...)` prunes row groups based on column statistics. S3 and GCS file objects are also seekable, so this should work across all major cloud storage backends. For `FsspecInputFile` (the default IO for cloud storage), `open()` returns a seekable file. For `PyArrowFile`, `open(seekable=True)` returns a `pyarrow.NativeFile` via `open_input_file()`, which is also seekable.
 
-3. **Fallback**: If the Parquet file has no column statistics (e.g., written by engines that don't produce them), `split_by_row_group` should return all row groups — verify this is the case so it degrades gracefully.
+3. **Fallback**: If the Parquet file has no column statistics (e.g., written by engines that don't produce them), `split_by_row_group` returns all row groups — verified this degrades gracefully.
 
 4. **The "Temporary fix until PyArrow 21" block** (lines 1674–1682): This re-applies the filter on every batch in Python. After row-group pruning, this is still needed for correctness (row-group stats are ranges, not exact filters), but it will process far fewer rows.
 
