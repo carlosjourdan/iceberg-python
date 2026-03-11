@@ -1645,50 +1645,60 @@ def _task_to_record_batches(
 
         file_project_schema = prune_columns(file_schema, projected_field_ids, select_full_types=False)
 
-        fragment_scanner = ds.Scanner.from_fragment(
-            fragment=fragment,
-            schema=physical_schema,
-            # This will push down the query to Arrow.
-            # But in case there are positional deletes, we have to apply them first
-            filter=pyarrow_filter if not positional_deletes else None,
-            columns=[col.name for col in file_project_schema.columns],
-        )
+        # Row-group predicate pushdown: use Parquet row group statistics to skip
+        # row groups whose min/max ranges don't match the filter.
+        # When positional deletes are present, skip pruning since delete indices
+        # are file-global and depend on knowing exact row offsets.
+        if pyarrow_filter is not None and not positional_deletes and isinstance(fragment, ds.ParquetFileFragment):
+            row_group_fragments = fragment.split_by_row_group(filter=pyarrow_filter)
+        else:
+            row_group_fragments = [fragment]
 
         next_index = 0
-        batches = fragment_scanner.to_batches()
-        for batch in batches:
-            next_index = next_index + len(batch)
-            current_index = next_index - len(batch)
-            current_batch = batch
+        for rg_fragment in row_group_fragments:
+            fragment_scanner = ds.Scanner.from_fragment(
+                fragment=rg_fragment,
+                schema=physical_schema,
+                # This will push down the query to Arrow.
+                # But in case there are positional deletes, we have to apply them first
+                filter=pyarrow_filter if not positional_deletes else None,
+                columns=[col.name for col in file_project_schema.columns],
+            )
 
-            if positional_deletes:
-                # Create the mask of indices that we're interested in
-                indices = _combine_positional_deletes(positional_deletes, current_index, current_index + len(batch))
-                current_batch = current_batch.take(indices)
+            batches = fragment_scanner.to_batches()
+            for batch in batches:
+                next_index = next_index + len(batch)
+                current_index = next_index - len(batch)
+                current_batch = batch
 
-            # skip empty batches
-            if current_batch.num_rows == 0:
-                continue
+                if positional_deletes:
+                    # Create the mask of indices that we're interested in
+                    indices = _combine_positional_deletes(positional_deletes, current_index, current_index + len(batch))
+                    current_batch = current_batch.take(indices)
 
-            # Apply the user filter
-            if pyarrow_filter is not None:
-                # Temporary fix until PyArrow 21 is released ( https://github.com/apache/arrow/pull/46057 )
-                table = pa.Table.from_batches([current_batch])
-                table = table.filter(pyarrow_filter)
                 # skip empty batches
-                if table.num_rows == 0:
+                if current_batch.num_rows == 0:
                     continue
 
-                current_batch = table.combine_chunks().to_batches()[0]
+                # Apply the user filter
+                if pyarrow_filter is not None:
+                    # Temporary fix until PyArrow 21 is released ( https://github.com/apache/arrow/pull/46057 )
+                    table = pa.Table.from_batches([current_batch])
+                    table = table.filter(pyarrow_filter)
+                    # skip empty batches
+                    if table.num_rows == 0:
+                        continue
 
-            yield _to_requested_schema(
-                projected_schema,
-                file_project_schema,
-                current_batch,
-                downcast_ns_timestamp_to_us=downcast_ns_timestamp_to_us,
-                projected_missing_fields=projected_missing_fields,
-                allow_timestamp_tz_mismatch=True,
-            )
+                    current_batch = table.combine_chunks().to_batches()[0]
+
+                yield _to_requested_schema(
+                    projected_schema,
+                    file_project_schema,
+                    current_batch,
+                    downcast_ns_timestamp_to_us=downcast_ns_timestamp_to_us,
+                    projected_missing_fields=projected_missing_fields,
+                    allow_timestamp_tz_mismatch=True,
+                )
 
 
 def _read_all_delete_files(io: FileIO, tasks: Iterable[FileScanTask]) -> dict[str, list[ChunkedArray]]:

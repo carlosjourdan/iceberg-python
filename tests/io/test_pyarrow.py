@@ -4988,3 +4988,234 @@ def test_partition_column_projection_with_schema_evolution(catalog: InMemoryCata
     result_sorted = result.sort_by("name")
     assert result_sorted["name"].to_pylist() == ["Alice", "Bob", "Charlie", "David"]
     assert result_sorted["new_column"].to_pylist() == [None, None, "new1", "new2"]
+
+
+def _write_table_to_file_with_row_group_size(filepath: str, schema: pa.Schema, table: pa.Table, row_group_size: int) -> str:
+    with pq.ParquetWriter(filepath, schema, write_statistics=True) as writer:
+        for i in range(0, len(table), row_group_size):
+            writer.write_table(table.slice(i, row_group_size))
+    return filepath
+
+
+def _write_data_file_with_row_groups(filepath: str, schema: pa.Schema, table: pa.Table, row_group_size: int) -> DataFile:
+    filepath = _write_table_to_file_with_row_group_size(filepath, schema, table, row_group_size)
+    return DataFile.from_args(
+        content=DataFileContent.DATA,
+        file_path=filepath,
+        file_format=FileFormat.PARQUET,
+        partition={},
+        record_count=len(table),
+        file_size_in_bytes=os.path.getsize(filepath),
+    )
+
+
+def test_task_to_record_batches_row_group_pruning(tmpdir: str) -> None:
+    """Test that row-group predicate pushdown skips non-matching row groups."""
+    from pyiceberg.expressions import EqualTo
+    from pyiceberg.expressions.visitors import bind
+
+    iceberg_schema = Schema(
+        NestedField(1, "id", IntegerType(), required=False),
+        NestedField(2, "value", StringType(), required=False),
+    )
+    pyarrow_schema = schema_to_pyarrow(
+        iceberg_schema, metadata={ICEBERG_SCHEMA: bytes(iceberg_schema.model_dump_json(), UTF8)}
+    )
+
+    # Create sorted data so row groups have non-overlapping ranges
+    # Row group 0: id 0-9, Row group 1: id 10-19, Row group 2: id 20-29
+    ids = list(range(30))
+    values = [f"val_{i}" for i in range(30)]
+    arrow_table = pa.table(
+        [pa.array(ids, type=pa.int32()), pa.array(values, type=pa.string())],
+        schema=pyarrow_schema,
+    )
+
+    data_file = _write_data_file_with_row_groups(
+        f"{tmpdir}/row_group_pruning.parquet", pyarrow_schema, arrow_table, row_group_size=10
+    )
+
+    # Verify we have 3 row groups
+    pf = pq.ParquetFile(f"{tmpdir}/row_group_pruning.parquet")
+    assert pf.metadata.num_row_groups == 3
+
+    bound_filter = bind(iceberg_schema, EqualTo("id", 5), case_sensitive=True)
+
+    # Filter for id == 5 (should only be in row group 0)
+    batches = list(
+        _task_to_record_batches(
+            PyArrowFileIO(),
+            FileScanTask(data_file),
+            bound_row_filter=bound_filter,
+            projected_schema=iceberg_schema,
+            table_schema=iceberg_schema,
+            projected_field_ids={1, 2},
+            positional_deletes=None,
+            case_sensitive=True,
+        )
+    )
+
+    # Should return exactly 1 batch (from the one matching row group)
+    assert len(batches) == 1
+    result = pa.Table.from_batches(batches)
+    assert result.num_rows == 1
+    assert result.column("id").to_pylist() == [5]
+
+
+def test_task_to_record_batches_row_group_pruning_no_match(tmpdir: str) -> None:
+    """Test that all row groups are skipped when filter matches nothing."""
+    from pyiceberg.expressions import EqualTo
+    from pyiceberg.expressions.visitors import bind
+
+    iceberg_schema = Schema(
+        NestedField(1, "id", IntegerType(), required=False),
+    )
+    pyarrow_schema = schema_to_pyarrow(
+        iceberg_schema, metadata={ICEBERG_SCHEMA: bytes(iceberg_schema.model_dump_json(), UTF8)}
+    )
+
+    ids = list(range(30))
+    arrow_table = pa.table([pa.array(ids, type=pa.int32())], schema=pyarrow_schema)
+
+    data_file = _write_data_file_with_row_groups(
+        f"{tmpdir}/row_group_pruning_no_match.parquet", pyarrow_schema, arrow_table, row_group_size=10
+    )
+
+    bound_filter = bind(iceberg_schema, EqualTo("id", 999), case_sensitive=True)
+
+    # Filter for id == 999 (not in any row group)
+    batches = list(
+        _task_to_record_batches(
+            PyArrowFileIO(),
+            FileScanTask(data_file),
+            bound_row_filter=bound_filter,
+            projected_schema=iceberg_schema,
+            table_schema=iceberg_schema,
+            projected_field_ids={1},
+            positional_deletes=None,
+            case_sensitive=True,
+        )
+    )
+
+    assert len(batches) == 0
+
+
+def test_task_to_record_batches_row_group_pruning_all_match(tmpdir: str) -> None:
+    """Test that no row groups are pruned when filter could match all."""
+    from pyiceberg.expressions import GreaterThanOrEqual
+    from pyiceberg.expressions.visitors import bind
+
+    iceberg_schema = Schema(
+        NestedField(1, "id", IntegerType(), required=False),
+    )
+    pyarrow_schema = schema_to_pyarrow(
+        iceberg_schema, metadata={ICEBERG_SCHEMA: bytes(iceberg_schema.model_dump_json(), UTF8)}
+    )
+
+    ids = list(range(30))
+    arrow_table = pa.table([pa.array(ids, type=pa.int32())], schema=pyarrow_schema)
+
+    data_file = _write_data_file_with_row_groups(
+        f"{tmpdir}/row_group_pruning_all_match.parquet", pyarrow_schema, arrow_table, row_group_size=10
+    )
+
+    bound_filter = bind(iceberg_schema, GreaterThanOrEqual("id", 0), case_sensitive=True)
+
+    # Filter for id >= 0 (matches all row groups)
+    batches = list(
+        _task_to_record_batches(
+            PyArrowFileIO(),
+            FileScanTask(data_file),
+            bound_row_filter=bound_filter,
+            projected_schema=iceberg_schema,
+            table_schema=iceberg_schema,
+            projected_field_ids={1},
+            positional_deletes=None,
+            case_sensitive=True,
+        )
+    )
+
+    # All 3 row groups should be returned
+    assert len(batches) == 3
+    result = pa.Table.from_batches(batches)
+    assert result.num_rows == 30
+
+
+def test_task_to_record_batches_row_group_pruning_skipped_with_positional_deletes(tmpdir: str) -> None:
+    """Test that row-group pruning is skipped when positional deletes are present."""
+    from pyiceberg.expressions import EqualTo
+    from pyiceberg.expressions.visitors import bind
+
+    iceberg_schema = Schema(
+        NestedField(1, "id", IntegerType(), required=False),
+    )
+    pyarrow_schema = schema_to_pyarrow(
+        iceberg_schema, metadata={ICEBERG_SCHEMA: bytes(iceberg_schema.model_dump_json(), UTF8)}
+    )
+
+    ids = list(range(30))
+    arrow_table = pa.table([pa.array(ids, type=pa.int32())], schema=pyarrow_schema)
+
+    data_file = _write_data_file_with_row_groups(
+        f"{tmpdir}/row_group_pruning_pos_deletes.parquet", pyarrow_schema, arrow_table, row_group_size=10
+    )
+
+    # Provide empty positional deletes (truthy list triggers the no-pruning path)
+    positional_deletes = [pa.chunked_array([pa.array([], type=pa.int64())])]
+
+    bound_filter = bind(iceberg_schema, EqualTo("id", 5), case_sensitive=True)
+
+    # Filter for id == 5, but positional deletes are present so pruning should be skipped
+    batches = list(
+        _task_to_record_batches(
+            PyArrowFileIO(),
+            FileScanTask(data_file),
+            bound_row_filter=bound_filter,
+            projected_schema=iceberg_schema,
+            table_schema=iceberg_schema,
+            projected_field_ids={1},
+            positional_deletes=positional_deletes,
+            case_sensitive=True,
+        )
+    )
+
+    # All 3 row groups are scanned (no pruning), but filter still applied per-batch
+    # so only the matching row is returned
+    result = pa.Table.from_batches(batches)
+    assert result.num_rows == 1
+    assert result.column("id").to_pylist() == [5]
+
+
+def test_task_to_record_batches_row_group_pruning_with_always_true(tmpdir: str) -> None:
+    """Test that row-group pruning is not applied when filter is AlwaysTrue."""
+    iceberg_schema = Schema(
+        NestedField(1, "id", IntegerType(), required=False),
+    )
+    pyarrow_schema = schema_to_pyarrow(
+        iceberg_schema, metadata={ICEBERG_SCHEMA: bytes(iceberg_schema.model_dump_json(), UTF8)}
+    )
+
+    ids = list(range(30))
+    arrow_table = pa.table([pa.array(ids, type=pa.int32())], schema=pyarrow_schema)
+
+    data_file = _write_data_file_with_row_groups(
+        f"{tmpdir}/row_group_pruning_always_true.parquet", pyarrow_schema, arrow_table, row_group_size=10
+    )
+
+    batches = list(
+        _task_to_record_batches(
+            PyArrowFileIO(),
+            FileScanTask(data_file),
+            bound_row_filter=AlwaysTrue(),
+            projected_schema=iceberg_schema,
+            table_schema=iceberg_schema,
+            projected_field_ids={1},
+            positional_deletes=None,
+            case_sensitive=True,
+        )
+    )
+
+    # All 3 row groups returned
+    assert len(batches) == 3
+    result = pa.Table.from_batches(batches)
+    assert result.num_rows == 30
